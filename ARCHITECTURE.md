@@ -54,9 +54,14 @@
 
 ### 4.2 堆利用类（`detectors/heap_vuln.py`）
 
-- `HEAP.DOUBLE_FREE`：同一绑定二次 `free` 且中间无重绑定。
+- 规则已升级为“槽位状态跟踪”模型（函数内）：
+  - 提取候选指针槽位（包括 `ptr_slot[idx]`）
+  - 跟踪状态：`UNKNOWN / FREED / NULL`
+  - 支持 free-like 包装函数识别（内部调用 `free/munmap` 的子函数）
+- `HEAP.DOUBLE_FREE`：同一槽位二次 `free` 且中间无重绑定。
 - `HEAP.UAF.CALL`：free 后作为参数传入读写 sink。
 - `HEAP.UAF.DEREF`：free 后发生解引用访问。
+- `HEAP.FREE.NOT_CLEARED`：free/delete 后槽位未置空（典型“只清 size 不清 ptr”）。
 
 ## 5. UI 展示
 
