@@ -31,6 +31,7 @@
 - `HEAP.FLAG_OFFSET_MISMATCH`：free 后状态清理写入了错误字段偏移（如写到 `+0x200` 但状态位在 `+0x208`）
 - `HEAP.ALLOC.UNINITIALIZED_CONTAINER`：控制容器由 `malloc` 建立后未初始化就进入全局状态路径
 - `HEAP.CSTR.UNBOUNDED_PRINTF`：`printf("%s", ptr)` 这类无长度上限字符串输出，参数来自堆路径时可导致越界读/信息泄露
+- `HEAP.REFCOUNT.BYPASS_FREE`：同一变量在某路径直接 `free(var)`，但其他路径使用 `--var->count <= 0` 才释放，提示引用计数释放语义不一致（可导致共享引用场景下 UAF）
 
 堆规则已升级为“槽位状态跟踪”：
 

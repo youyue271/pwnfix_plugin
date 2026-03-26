@@ -66,6 +66,7 @@
 - `HEAP.FLAG_OFFSET_MISMATCH`：清理偏移与真实状态位偏移不一致（例如 `+0x200` 与 `+0x208` 混用）。
 - `HEAP.ALLOC.UNINITIALIZED_CONTAINER`：容器 `malloc` 后未初始化即进入全局状态路径。
 - `HEAP.CSTR.UNBOUNDED_PRINTF`：`printf("%s", ptr)` 使用堆来源字符串且无长度上限。
+- `HEAP.REFCOUNT.BYPASS_FREE`：同一变量既存在 `--var->count <= 0` 的受保护释放，也存在直接 `free(var)` 路径，提示引用计数释放语义不一致。
 
 压误报策略（当前）：
 

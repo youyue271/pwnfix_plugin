@@ -5,6 +5,8 @@ import ida_funcs
 import idautils
 import idc
 import ida_segment
+import re
+import re
 
 from core.models import FixAction
 from detectors.base import BaseDetector
@@ -78,6 +80,7 @@ class HeapVulnDetector(BaseDetector):
         self._free_like_cache = {}
         self._ignored_deref_eas = set()
         self._has_flag_offset_mismatch = False
+        self._free_call_eas_by_var = {}
 
     def visit_expr(self, expr):
         if expr.op == ida_hexrays.cot_asg:
@@ -89,6 +92,7 @@ class HeapVulnDetector(BaseDetector):
         return 0
 
     def finalize(self):
+        self._report_refcount_bypass_free()
         self._report_clear_offset_mismatch_by_disasm()
 
         for slot_key, alloc_meta in sorted(
@@ -301,6 +305,13 @@ class HeapVulnDetector(BaseDetector):
         if not args:
             return
 
+        free_arg = strip_casts(args[0])
+        free_arg_name = get_expr_name(free_arg) or get_var_id(free_arg) or ""
+        if free_arg_name:
+            self._free_call_eas_by_var.setdefault(free_arg_name, []).append(
+                self.ctx.normalize_ea(call_expr.ea)
+            )
+
         all_slots = []
         for arg in args:
             all_slots.extend(
@@ -417,6 +428,126 @@ class HeapVulnDetector(BaseDetector):
         for slot_key in slot_keys:
             if slot_key in self.pending_uninit_container_allocs:
                 self.initialized_container_allocs.add(slot_key)
+
+    def _report_refcount_bypass_free(self):
+        cfunc = getattr(self.ctx, "cfunc", None)
+        if not cfunc:
+            return
+
+        pseudo = str(cfunc)
+        lines = pseudo.splitlines()
+        if not lines:
+            return
+
+        value_ptr_vars = set()
+        guarded_vars = set()
+        free_kinds_by_var = {}
+        pending_guard_var = None
+
+        assign_re = re.compile(r"^\s*([A-Za-z_]\w*)\s*=.*->value_ptr\s*;")
+        guard_re = re.compile(r"--\s*([A-Za-z_]\w*)->count\s*<=\s*0")
+        free_re = re.compile(r"\bfree\s*\(\s*([A-Za-z_]\w*)\s*\)\s*;")
+
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            m_assign = assign_re.search(line)
+            if m_assign:
+                value_ptr_vars.add(m_assign.group(1))
+
+            m_guard = guard_re.search(line)
+            if m_guard:
+                pending_guard_var = m_guard.group(1)
+                guarded_vars.add(pending_guard_var)
+
+            m_free = free_re.search(line)
+            if not m_free:
+                if line.endswith(";") and pending_guard_var:
+                    pending_guard_var = None
+                continue
+
+            var_name = m_free.group(1)
+            is_guarded = pending_guard_var == var_name or bool(
+                guard_re.search(line)
+            )
+            if is_guarded:
+                guarded_vars.add(var_name)
+            free_kinds_by_var.setdefault(var_name, []).append(is_guarded)
+            pending_guard_var = None
+
+        suspicious_vars = {
+            var_name
+            for var_name, kinds in free_kinds_by_var.items()
+            if any(kinds) and not all(kinds)
+        }
+        suspicious_vars &= value_ptr_vars
+        suspicious_vars &= guarded_vars
+        if not suspicious_vars:
+            return
+
+        name_to_var_id = self._lvar_name_to_var_id()
+
+        for var_name in sorted(suspicious_vars):
+            var_key = name_to_var_id.get(var_name, var_name)
+            free_eas = self._free_call_eas_by_var.get(var_key, [])
+            if not free_eas:
+                free_eas = self._free_call_eas_by_var.get(var_name, [])
+            kinds = free_kinds_by_var.get(var_name, [])
+            if not free_eas or not kinds:
+                continue
+
+            for idx, free_ea in enumerate(free_eas):
+                is_guarded = kinds[idx] if idx < len(kinds) else False
+                if is_guarded:
+                    continue
+
+                self.report(
+                    rule_id="HEAP.REFCOUNT.BYPASS_FREE",
+                    category="Use After Free",
+                    severity="high",
+                    confidence="medium",
+                    ea=free_ea,
+                    sink="free",
+                    description=(
+                        f"{var_name} is directly freed on one path while other paths use refcount-guarded release."
+                    ),
+                    evidence=(
+                        f"direct free at {free_ea:#x}",
+                        f"same variable '{var_name}' also appears in '--{var_name}->count <= 0' guarded free",
+                        f"'{var_name}' originates from a '->value_ptr' assignment",
+                    ),
+                    recommendations=(
+                        "Use a single ownership model: always dec-ref then free at zero.",
+                        "Avoid direct free on shared value pointers while aliases may exist (e.g., clone paths).",
+                    ),
+                    fix_actions=(
+                        FixAction(
+                            key="enforce_refcount_release",
+                            label="Unify refcount release",
+                            description="Replace direct free(var) with decref-and-free-at-zero semantics on all paths.",
+                            patchable=False,
+                        ),
+                    ),
+                )
+
+    def _lvar_name_to_var_id(self):
+        cfunc = getattr(self.ctx, "cfunc", None)
+        if not cfunc:
+            return {}
+
+        try:
+            lvars = cfunc.get_lvars()
+        except Exception:
+            return {}
+
+        mapping = {}
+        for idx, lvar in enumerate(lvars):
+            name = getattr(lvar, "name", "")
+            if name:
+                mapping[name] = f"v_{idx}"
+        return mapping
 
     def _report_clear_offset_mismatch_by_disasm(self):
         func = ida_funcs.get_func(self.ctx.function_ea)
