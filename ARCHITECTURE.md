@@ -57,11 +57,21 @@
 - 规则已升级为“槽位状态跟踪”模型（函数内）：
   - 提取候选指针槽位（包括 `ptr_slot[idx]`）
   - 跟踪状态：`UNKNOWN / FREED / NULL`
+  - 轻量别名收束：支持一层“局部变量 -> 全局槽位”映射
   - 支持 free-like 包装函数识别（内部调用 `free/munmap` 的子函数）
 - `HEAP.DOUBLE_FREE`：同一槽位二次 `free` 且中间无重绑定。
 - `HEAP.UAF.CALL`：free 后作为参数传入读写 sink。
 - `HEAP.UAF.DEREF`：free 后发生解引用访问。
 - `HEAP.FREE.NOT_CLEARED`：free/delete 后槽位未置空（典型“只清 size 不清 ptr”）。
+- `HEAP.FLAG_OFFSET_MISMATCH`：清理偏移与真实状态位偏移不一致（例如 `+0x200` 与 `+0x208` 混用）。
+- `HEAP.ALLOC.UNINITIALIZED_CONTAINER`：容器 `malloc` 后未初始化即进入全局状态路径。
+- `HEAP.CSTR.UNBOUNDED_PRINTF`：`printf("%s", ptr)` 使用堆来源字符串且无长度上限。
+
+压误报策略（当前）：
+
+- 对 `[*]`、`[dyn]` 这类不精确槽位，限制在高噪声规则中的触发条件。
+- 对 `g_...` 槽位增加可写段判定，避免把常量区误识别为容器。
+- 对清理不一致类问题，优先使用反汇编偏移证据（`HEAP.FLAG_OFFSET_MISMATCH`）作为高置信触发。
 
 ## 5. UI 展示
 

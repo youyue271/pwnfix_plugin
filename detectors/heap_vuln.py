@@ -1,12 +1,18 @@
 import ida_hexrays
 import ida_name
 import idaapi
+import ida_funcs
+import idautils
+import idc
+import ida_segment
 
 from core.models import FixAction
 from detectors.base import BaseDetector
 from utils.hexrays_helper import (
     get_expr_name,
+    get_string_literal,
     get_var_id,
+    is_stack_var,
     is_zero_expr,
     iter_call_args,
     iter_expr_children,
@@ -20,6 +26,17 @@ class HeapVulnDetector(BaseDetector):
     detector_name = "Heap Misuse Detector"
 
     FREE_SINKS = {"free"}
+    ALLOC_SINKS = {"malloc"}
+    INIT_CALL_DEST_ARG = {
+        "memset": 0,
+        "memcpy": 0,
+        "memmove": 0,
+        "strncpy": 0,
+        "strcpy": 0,
+        "read": 1,
+        "recv": 1,
+        "fgets": 0,
+    }
 
     STATE_FREED = "FREED"
     STATE_NULL = "NULL"
@@ -55,8 +72,12 @@ class HeapVulnDetector(BaseDetector):
         self.slot_states = {}
         self.slot_last_free = {}
         self.pending_container_clear = {}
+        self.pending_uninit_container_allocs = {}
+        self.initialized_container_allocs = set()
+        self.slot_aliases = {}
         self._free_like_cache = {}
         self._ignored_deref_eas = set()
+        self._has_flag_offset_mismatch = False
 
     def visit_expr(self, expr):
         if expr.op == ida_hexrays.cot_asg:
@@ -68,10 +89,49 @@ class HeapVulnDetector(BaseDetector):
         return 0
 
     def finalize(self):
+        self._report_clear_offset_mismatch_by_disasm()
+
+        for slot_key, alloc_meta in sorted(
+            self.pending_uninit_container_allocs.items(), key=lambda item: item[1]
+        ):
+            alloc_ea = alloc_meta[0]
+            if slot_key in self.initialized_container_allocs:
+                continue
+            self.report(
+                rule_id="HEAP.ALLOC.UNINITIALIZED_CONTAINER",
+                category="Heap State Desync",
+                severity="medium",
+                confidence="medium",
+                ea=alloc_ea,
+                sink="malloc",
+                description=(
+                    f"{slot_key} is assigned from malloc() without in-function initialization."
+                ),
+                evidence=(
+                    f"allocation at {alloc_ea:#x}",
+                    f"slot candidate: {slot_key}",
+                    "no memset/field-initialization on the allocated container observed in this function",
+                ),
+                recommendations=(
+                    "Initialize freshly allocated state blocks before exposing them globally.",
+                    "Use calloc() or explicit memset()/field setup for all control fields.",
+                ),
+                fix_actions=(
+                    FixAction(
+                        key="init_allocated_container",
+                        label="Initialize container state",
+                        description="Add explicit zero-initialization for the allocated container structure.",
+                        patchable=False,
+                    ),
+                ),
+            )
+
         for slot_key, free_ea in sorted(
             self.pending_container_clear.items(), key=lambda item: item[1]
         ):
             if self.slot_states.get(slot_key) != self.STATE_FREED:
+                continue
+            if not self._is_precise_slot(slot_key) and not self._has_flag_offset_mismatch:
                 continue
             self.report(
                 rule_id="HEAP.FREE.NOT_CLEARED",
@@ -103,18 +163,49 @@ class HeapVulnDetector(BaseDetector):
             )
 
     def _handle_assignment(self, expr):
-        target_slots = self._extract_slot_keys(expr.x, pointer_only=True)
-        if not target_slots:
-            return
+        raw_pointer_target_slots = self._extract_slot_keys(expr.x, pointer_only=True)
+        raw_all_target_slots = self._extract_slot_keys(expr.x, pointer_only=False)
+        pointer_target_slots = self._canonicalize_slot_set(raw_pointer_target_slots)
+        all_target_slots = self._canonicalize_slot_set(raw_all_target_slots)
 
         if is_zero_expr(expr.y):
-            for slot_key in target_slots:
+            for slot_key in pointer_target_slots:
                 self.slot_states[slot_key] = self.STATE_NULL
                 self.slot_last_free.pop(slot_key, None)
                 self.pending_container_clear.pop(slot_key, None)
+                self.pending_uninit_container_allocs.pop(slot_key, None)
+                self.initialized_container_allocs.discard(slot_key)
             return
 
-        source_slots = self._extract_slot_keys(expr.y, pointer_only=False)
+        if not pointer_target_slots and not all_target_slots:
+            return
+
+        rhs = strip_casts(expr.y)
+        rhs_sink = ""
+        if rhs and rhs.op == ida_hexrays.cot_call:
+            rhs_sink = (get_expr_name(rhs.x) or "").lower()
+
+        if rhs_sink in self.ALLOC_SINKS:
+            alloc_size = None
+            if rhs and rhs.op == ida_hexrays.cot_call:
+                rhs_args = iter_call_args(rhs)
+                if rhs_args:
+                    alloc_size = self.ctx.resolve_constant(rhs_args[0])
+            for slot_key in pointer_target_slots:
+                if self._is_container_slot(slot_key):
+                    if alloc_size is not None and alloc_size > 0x100:
+                        continue
+                    alloc_ea = self.ctx.normalize_ea(expr.ea)
+                    self.pending_uninit_container_allocs[slot_key] = (
+                        alloc_ea,
+                        alloc_size,
+                    )
+                    self.initialized_container_allocs.discard(slot_key)
+
+        source_slots = self._canonicalize_slot_set(
+            self._extract_slot_keys(expr.y, pointer_only=False)
+        )
+        self._update_local_aliases(raw_pointer_target_slots, source_slots, rhs_sink)
         inherited = next(
             (
                 source_slot
@@ -124,7 +215,7 @@ class HeapVulnDetector(BaseDetector):
             None,
         )
 
-        for slot_key in target_slots:
+        for slot_key in pointer_target_slots:
             if inherited:
                 free_ea = self.slot_last_free.get(inherited)
                 self.slot_states[slot_key] = self.STATE_FREED
@@ -138,6 +229,9 @@ class HeapVulnDetector(BaseDetector):
                 self.slot_states[slot_key] = self.STATE_UNKNOWN
                 self.slot_last_free.pop(slot_key, None)
                 self.pending_container_clear.pop(slot_key, None)
+                if rhs_sink not in self.ALLOC_SINKS:
+                    self.pending_uninit_container_allocs.pop(slot_key, None)
+                    self.initialized_container_allocs.discard(slot_key)
 
     def _handle_call(self, call_expr):
         sink = (get_expr_name(call_expr.x) or "").lower()
@@ -145,6 +239,8 @@ class HeapVulnDetector(BaseDetector):
             return
 
         args = iter_call_args(call_expr)
+        self._mark_container_init_by_call(sink, args)
+        self._handle_unbounded_string_sink(call_expr, sink, args)
 
         if self._is_free_like_sink(sink):
             self._handle_free_call(call_expr, sink, args)
@@ -158,8 +254,13 @@ class HeapVulnDetector(BaseDetector):
             if arg_index >= len(args):
                 continue
 
-            for slot_key in self._extract_slot_keys(args[arg_index], pointer_only=False):
+            slot_keys = self._canonicalize_slot_set(
+                self._extract_slot_keys(args[arg_index], pointer_only=False)
+            )
+            for slot_key in slot_keys:
                 if self.slot_states.get(slot_key) != self.STATE_FREED:
+                    continue
+                if not self._is_precise_slot(slot_key):
                     continue
 
                 free_ea = self.slot_last_free.get(slot_key)
@@ -202,7 +303,11 @@ class HeapVulnDetector(BaseDetector):
 
         all_slots = []
         for arg in args:
-            all_slots.extend(self._extract_slot_keys(arg, pointer_only=False))
+            all_slots.extend(
+                self._canonicalize_slot_set(
+                    self._extract_slot_keys(arg, pointer_only=False)
+                )
+            )
             self._mark_expr_eas_for_deref_ignore(arg)
 
         if not all_slots:
@@ -217,6 +322,9 @@ class HeapVulnDetector(BaseDetector):
         for slot_key in freed_slots:
             previous_free_ea = self.slot_last_free.get(slot_key)
             if (
+                self._is_container_slot(slot_key)
+                and self._is_precise_slot(slot_key)
+                and
                 self.slot_states.get(slot_key) == self.STATE_FREED
                 and previous_free_ea is not None
             ):
@@ -258,8 +366,13 @@ class HeapVulnDetector(BaseDetector):
         if self.ctx.normalize_ea(expr.ea) in self._ignored_deref_eas:
             return
 
-        for slot_key in self._extract_slot_keys(expr, pointer_only=False):
+        slot_keys = self._canonicalize_slot_set(
+            self._extract_slot_keys(expr, pointer_only=False)
+        )
+        for slot_key in slot_keys:
             if self.slot_states.get(slot_key) != self.STATE_FREED:
+                continue
+            if not self._is_precise_slot(slot_key):
                 continue
 
             free_ea = self.slot_last_free.get(slot_key)
@@ -292,6 +405,190 @@ class HeapVulnDetector(BaseDetector):
                     ),
                 ),
             )
+
+    def _mark_container_init_by_call(self, sink, args):
+        dest_idx = self.INIT_CALL_DEST_ARG.get(sink)
+        if dest_idx is None or dest_idx >= len(args):
+            return
+
+        slot_keys = self._canonicalize_slot_set(
+            self._extract_slot_keys(args[dest_idx], pointer_only=False)
+        )
+        for slot_key in slot_keys:
+            if slot_key in self.pending_uninit_container_allocs:
+                self.initialized_container_allocs.add(slot_key)
+
+    def _report_clear_offset_mismatch_by_disasm(self):
+        func = ida_funcs.get_func(self.ctx.function_ea)
+        if not func:
+            return
+
+        clear_ea = None
+        touch_208 = False
+        free_seen = False
+
+        for ea in idautils.FuncItems(func.start_ea):
+            mnem = (idc.print_insn_mnem(ea) or "").lower()
+            op0 = (idc.print_operand(ea, 0) or "").lower()
+            op1 = (idc.print_operand(ea, 1) or "").lower()
+
+            if "+208h" in op0 or "+208h" in op1:
+                touch_208 = True
+            if "call" in mnem and "free" in op0:
+                free_seen = True
+            if (
+                mnem == "mov"
+                and "byte ptr" in op0
+                and "+200h" in op0
+                and op1 in {"0", "0h"}
+            ):
+                clear_ea = ea
+
+        if not (clear_ea and touch_208 and free_seen):
+            return
+
+        self.report(
+            rule_id="HEAP.FLAG_OFFSET_MISMATCH",
+            category="Heap State Desync",
+            severity="high",
+            confidence="high",
+            ea=clear_ea,
+            sink="assign",
+            description=(
+                "Post-free cleanup writes to +0x200 byte while transaction/state logic uses +0x208."
+            ),
+            evidence=(
+                f"suspicious clear at {clear_ea:#x}: byte ptr [base+0x200] = 0",
+                "same function also accesses base+0x208 as state flag",
+                "free() call observed in the same state-transition path",
+            ),
+            recommendations=(
+                "Clear the actual state flag field (likely +0x208), not the pointer field low byte.",
+                "Keep transaction pointer and transaction flag updates consistent after free.",
+            ),
+            fix_actions=(
+                FixAction(
+                    key="fix_state_flag_offset",
+                    label="Fix state flag offset",
+                    description="Patch cleanup store target from +0x200 to the real flag offset (+0x208).",
+                    patchable=False,
+                ),
+            ),
+        )
+        self._has_flag_offset_mismatch = True
+
+    def _handle_unbounded_string_sink(self, call_expr, sink, args):
+        if sink != "printf" or len(args) < 2:
+            return
+
+        fmt = get_string_literal(args[0])
+        if not fmt:
+            return
+
+        for fmt_s_index in self._format_s_arg_indices(fmt):
+            arg_index = 1 + fmt_s_index
+            if arg_index >= len(args):
+                continue
+
+            arg = args[arg_index]
+            if not self._is_risky_heap_cstring_arg(arg):
+                continue
+
+            self.report(
+                rule_id="HEAP.CSTR.UNBOUNDED_PRINTF",
+                category="Information Leak",
+                severity="high",
+                confidence="medium",
+                ea=call_expr.ea,
+                sink=sink,
+                description=(
+                    f"printf consumes a heap-derived string via unbounded %s (arg#{arg_index})."
+                ),
+                evidence=(
+                    f"format string: {fmt}",
+                    f"argument index: {arg_index}",
+                    "heap-derived pointer may be non-NUL-terminated",
+                ),
+                recommendations=(
+                    "Use precision-limited formatting (e.g. %.Ns) or tracked-length output APIs.",
+                    "Ensure copied heap buffers are NUL-terminated before %s sinks.",
+                ),
+                fix_actions=(
+                    FixAction(
+                        key="bound_printf_string",
+                        label="Bound %s output",
+                        description="Replace unbounded %s with precision-limited output tied to the stored length.",
+                        patchable=False,
+                    ),
+                ),
+            )
+
+    def _format_s_arg_indices(self, fmt):
+        indices = []
+        fmt_arg_index = 0
+        i = 0
+        while i < len(fmt):
+            if fmt[i] != "%":
+                i += 1
+                continue
+
+            i += 1
+            if i < len(fmt) and fmt[i] == "%":
+                i += 1
+                continue
+
+            while i < len(fmt) and fmt[i] in "-+ #0":
+                i += 1
+
+            while i < len(fmt) and fmt[i].isdigit():
+                i += 1
+
+            has_precision = False
+            if i < len(fmt) and fmt[i] == ".":
+                has_precision = True
+                i += 1
+                while i < len(fmt) and fmt[i].isdigit():
+                    i += 1
+
+            while i < len(fmt) and fmt[i] in "hljztL":
+                i += 1
+
+            if i >= len(fmt):
+                break
+
+            spec = fmt[i]
+            if spec == "s" and not has_precision:
+                indices.append(fmt_arg_index)
+
+            if spec not in ("n",):
+                fmt_arg_index += 1
+
+            i += 1
+
+        return indices
+
+    def _is_risky_heap_cstring_arg(self, expr):
+        if not expr:
+            return False
+        if get_string_literal(expr):
+            return False
+        if is_stack_var(expr):
+            return False
+
+        base = unwrap_expr(strip_casts(expr))
+        if not self._is_pointer_expr(base):
+            return False
+
+        if base.op in (
+            ida_hexrays.cot_memref,
+            ida_hexrays.cot_memptr,
+            ida_hexrays.cot_ptr,
+            ida_hexrays.cot_idx,
+        ):
+            return True
+
+        slot_keys = self._extract_slot_keys(base, pointer_only=False)
+        return any(self._is_container_slot(key) for key in slot_keys)
 
     def _extract_slot_keys(self, expr, pointer_only):
         found = set()
@@ -335,6 +632,8 @@ class HeapVulnDetector(BaseDetector):
             return direct_id
 
         if expr.op == ida_hexrays.cot_ptr:
+            if pointer_only and not self._is_pointer_expr(expr):
+                return None
             return self._build_symbolic_slot_key(expr)
 
         return None
@@ -368,6 +667,44 @@ class HeapVulnDetector(BaseDetector):
         for child in iter_expr_children(expr):
             self._collect_symbol_ids(child, global_ids, local_ids)
 
+    def _update_local_aliases(self, raw_pointer_targets, source_slots, rhs_sink):
+        container_sources = [slot for slot in source_slots if self._is_container_slot(slot)]
+        for raw_slot in raw_pointer_targets:
+            base = self._slot_base(raw_slot)
+            if not base.startswith("v_"):
+                continue
+            if container_sources:
+                self.slot_aliases[base] = container_sources[0]
+                continue
+            if rhs_sink in self.ALLOC_SINKS or not source_slots:
+                self.slot_aliases.pop(base, None)
+
+    def _canonicalize_slot_set(self, slots):
+        return {self._canonicalize_slot_key(slot) for slot in slots if slot}
+
+    def _canonicalize_slot_key(self, slot_key):
+        if not slot_key:
+            return slot_key
+        base = self._slot_base(slot_key)
+        alias = self.slot_aliases.get(base)
+        if not alias:
+            return slot_key
+        if slot_key == base:
+            return alias
+        suffix = slot_key[len(base) :]
+        if suffix.startswith("[") or suffix.startswith("->"):
+            return alias
+        return alias + suffix
+
+    def _slot_base(self, slot_key):
+        if not slot_key:
+            return ""
+        for sep in ("[", "->"):
+            idx = slot_key.find(sep)
+            if idx != -1:
+                return slot_key[:idx]
+        return slot_key
+
     def _is_pointer_expr(self, expr):
         expr = strip_casts(expr)
         if not expr:
@@ -378,7 +715,21 @@ class HeapVulnDetector(BaseDetector):
             return False
 
     def _is_container_slot(self, slot_key):
-        return slot_key.startswith("g_") or "[" in slot_key
+        if "[" in slot_key:
+            return True
+        if not slot_key.startswith("g_"):
+            return False
+        try:
+            addr = int(slot_key[2:], 16)
+            seg = ida_segment.getseg(addr)
+            if not seg:
+                return False
+            return bool(seg.perm & ida_segment.SEGPERM_WRITE)
+        except Exception:
+            return False
+
+    def _is_precise_slot(self, slot_key):
+        return "[dyn]" not in slot_key and "[*]" not in slot_key
 
     def _mark_expr_eas_for_deref_ignore(self, expr):
         expr = strip_casts(expr)

@@ -28,12 +28,16 @@
 - `HEAP.UAF.CALL`：free 后作为参数传给读写 sink（如 `puts/read/write/memcpy` 等）
 - `HEAP.UAF.DEREF`：free 后继续解引用
 - `HEAP.FREE.NOT_CLEARED`：delete/free 后检测到指针槽位未清空（例如只清 size 不清 ptr）
+- `HEAP.FLAG_OFFSET_MISMATCH`：free 后状态清理写入了错误字段偏移（如写到 `+0x200` 但状态位在 `+0x208`）
+- `HEAP.ALLOC.UNINITIALIZED_CONTAINER`：控制容器由 `malloc` 建立后未初始化就进入全局状态路径
+- `HEAP.CSTR.UNBOUNDED_PRINTF`：`printf("%s", ptr)` 这类无长度上限字符串输出，参数来自堆路径时可导致越界读/信息泄露
 
 堆规则已升级为“槽位状态跟踪”：
 
 - 自动提取候选指针槽位（含 `ptr_slot[idx]`）
 - 跟踪状态：`UNKNOWN / FREED / NULL`
 - 轻量传播：当已释放槽位赋值到新指针变量时，保留 freed 状态
+- 包含一层“局部变量 -> 全局槽位”别名收束，降低路径噪音
 
 ## 一键修补（当前）
 
@@ -50,6 +54,7 @@
 - 当前状态跟踪以“单函数内”为主，跨函数别名传播还不完整。
 - 暂不支持完善的跨函数/跨容器别名追踪（例如复杂全局数组槽位、结构体间接传递）。
 - 自动修补能力刻意收敛，避免高误改；目前没有 UI 级回滚面板。
+- 某些动态索引槽位（`[*]` / `[dyn]`）仍可能带来保守告警，建议结合上下文人工确认。
 
 ## 下一步（计划）
 
